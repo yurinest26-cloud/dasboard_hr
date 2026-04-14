@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, date
-from streamlit_plotly_events import plotly_events
+from streamlit_plotly_events import plotly_events  # pip install streamlit-plotly-events
 
 
 # =========================
@@ -23,7 +23,7 @@ try:
         "manager5": {"password": st.secrets["users"]["manager5_password"], "role": "Manager", "name": "Manager 5"},
     }
 except:
-    # Fallback (использовать только для разработки!)
+    # Fallback — ТОЛЬКО для разработки
     USERS = {
         "hr": {"password": "hr123", "role": "HR"},
         "manager1": {"password": "123", "role": "Manager", "name": "Manager 1"},
@@ -87,7 +87,7 @@ def load_data(uploaded_file):
             st.error("❌ Лист 'Start Date' не найден.")
             st.stop()
 
-        # --- Загрузка: Summary Data ---
+        # --- Summary Data ---
         df_main = pd.read_excel(uploaded_file, sheet_name="Summary Data", header=0)
         if "ID" not in df_main.columns:
             st.error("❌ Колонка 'ID' не найдена в листе 'Summary Data'.")
@@ -100,10 +100,10 @@ def load_data(uploaded_file):
         df_main = df_main.dropna(subset=["ID"])
         df_main["ID"] = df_main["ID"].astype(int)
 
-        # --- Загрузка: Start Date ---
+        # --- Start Date ---
         df_dates = pd.read_excel(uploaded_file, sheet_name="Start Date", header=0)
         if "ID" not in df_dates.columns or "Hire Date" not in df_dates.columns:
-            st.error("❌ В листе 'Start Date' должны быть: 'ID' и 'Hire Date'.")
+            st.error("❌ В листе 'Start Date' должны быть 'ID' и 'Hire Date'.")
             st.stop()
 
         df_dates = df_dates[["ID", "Hire Date"]].copy()
@@ -115,7 +115,7 @@ def load_data(uploaded_file):
         # --- Объединение ---
         df = df_main.merge(df_dates, on="ID", how="left")
         if df["hire_date"].isna().all():
-            st.warning("⚠️ Все даты найма — NaN. Проверьте ID.")
+            st.warning("⚠️ Все даты найма — NaN. Проверьте соответствие ID.")
         df = df.dropna(subset=["hire_date"])
 
         # --- Переименование ---
@@ -155,7 +155,7 @@ def load_data(uploaded_file):
         else:
             df["performance"] = 0.5
 
-        # --- Стаж в месяцах и группах ---
+        # --- Стаж ---
         df["hire_date"] = pd.to_datetime(df["hire_date"], errors="coerce")
         df = df.dropna(subset=["hire_date"])
         df["tenure_months"] = ((datetime.now() - df["hire_date"]).dt.days // 30).astype(int)
@@ -192,11 +192,11 @@ if uploaded_file is None:
 
 try:
     df = load_data(uploaded_file)
-except:
+except Exception as e:
     st.stop()
 
-if df.empty:
-    st.warning("❌ Нет данных после загрузки.")
+if df is None or df.empty:
+    st.warning("❌ Данные не загружены или пусты.")
     st.stop()
 
 
@@ -212,7 +212,7 @@ if st.session_state.role == "Manager":
 
 
 # =========================
-# DRILL-DOWN PATH
+# DRILL-DOWN
 # =========================
 drill_path = st.session_state.drill_path
 filtered_df = df.copy()
@@ -234,28 +234,41 @@ if filtered_df.empty:
 
 
 # =========================
-# ФИЛЬТРЫ
+# ФИЛЬТРЫ (безопасные — значения сверяются с текущими опциями)
 # =========================
 filters = st.session_state.filters
 for key in ["satisfaction", "position", "legal_entity"]:
     if key not in filters:
         filters[key] = []
 
+# Актуальные опции (после фильтров)
 sats_opt = ["low", "medium", "high"]
-pos_opt = sorted(filtered_df["position"].dropna().unique())
-ent_opt = sorted(filtered_df["legal_entity"].dropna().unique())
+pos_opt = filtered_df["position"].dropna().unique().tolist()
+ent_opt = filtered_df["legal_entity"].dropna().unique().tolist()
 
-sats = st.multiselect("Удовл. ЗП", sats_opt, default=filters["satisfaction"])
-positions = st.multiselect("Позиция", pos_opt, default=filters["position"])
-entities = st.multiselect("Юр. лицо", ent_opt, default=filters["legal_entity"])
+# 🔐 Очистка фильтров от устаревших значений
+filters["satisfaction"] = [s for s in filters["satisfaction"] if s in sats_opt]
+filters["position"] = [p for p in filters["position"] if p in pos_opt]
+filters["legal_entity"] = [e for e in filters["legal_entity"] if e in ent_opt]
 
+# Применение
+sats = st.multiselect("Удовл. ЗП", options=sats_opt, default=filters["satisfaction"])
+positions = st.multiselect("Позиция", options=pos_opt, default=filters["position"])
+entities = st.multiselect("Юр.лицо", options=ent_opt, default=filters["legal_entity"])
+
+# Сохранение
+filters.update({
+    "satisfaction": sats,
+    "position": positions,
+    "legal_entity": entities
+})
+
+# Применение фильтрации
 mask = pd.Series([True] * len(filtered_df), index=filtered_df.index)
 if sats: mask &= filtered_df["salary_satisfaction"].isin(sats)
 if positions: mask &= filtered_df["position"].isin(positions)
 if entities: mask &= filtered_df["legal_entity"].isin(entities)
 filtered_df = filtered_df[mask]
-
-filters.update({"satisfaction": sats, "position": positions, "legal_entity": entities})
 
 
 # =========================
@@ -306,7 +319,7 @@ k5.metric("Перф.", kpi_data["performance"])
 
 
 # =========================
-# ПРОЦЕНТНЫЕ ДОЛИ
+# ПРОЦЕНТЫ 📊
 # =========================
 st.markdown("---")
 st.subheader("📊 Доли (проценты)")
@@ -314,14 +327,14 @@ st.subheader("📊 Доли (проценты)")
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("### % Сотрудников по городам")
+    st.markdown("### % по городам")
     city_pct = filtered_df["city"].value_counts(normalize=True).reset_index()
     city_pct.columns = ["city", "percent"]
     city_pct["percent"] = (city_pct["percent"] * 100).round(1)
     fig_city = px.bar(city_pct, x="city", y="percent", text=city_pct["percent"].astype(str) + "%",
-                      title="Доля по городам", color_discrete_sequence=["#0068C9"])
+                      title="Доля сотрудников по городам", color_discrete_sequence=["#0068C9"])
     fig_city.update_layout(xaxis_categoryorder="total descending")
-    st.plotly_chart(fig_city, use_container_width=True)
+    st.plotly_chart(fig_city, width="stretch")
 
 with col2:
     st.markdown("### % Удовлетворённости ЗП")
@@ -329,7 +342,7 @@ with col2:
     sat_pct.columns = ["salary_satisfaction", "percent"]
     sat_pct["percent"] = (sat_pct["percent"] * 100).round(1)
     fig_sat = px.pie(sat_pct, names="salary_satisfaction", values="percent", title="Удовлетворённость ЗП (%)")
-    st.plotly_chart(fig_sat, use_container_width=True)
+    st.plotly_chart(fig_sat, width="stretch")
 
 
 # =========================
@@ -387,7 +400,7 @@ elif next_level == "employee" or len(drill_path) >= len(DRILL_LEVELS):
 
 
 # =========================
-# BOX PLOT СТАЖА ПО ДЕПАРТАМЕНТАМ
+# BOX PLOT СТАЖА
 # =========================
 if len(drill_path) < 3:
     st.markdown("---")
@@ -398,20 +411,20 @@ if len(drill_path) < 3:
     with col1:
         st.markdown("### 📦 Зарплаты (€)")
         fig_box = px.box(filtered_df, x="department", y="salary_eur", points="outliers",
-                         color="position", title="Распределение ЗП по департаментам")
+                         color="position", title="Распределение ЗП")
         fig_box.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig_box, use_container_width=True)
+        st.plotly_chart(fig_box, width="stretch")
 
     with col2:
         st.markdown("### ⏱ Стаж по департаментам")
         fig_tenure = px.box(filtered_df, x="department", y="tenure_months", points="outliers",
-                            title="Стаж сотрудников (месяцы)", color_discrete_sequence=["#29B09D"])
+                            title="Стаж (месяцы)", color_discrete_sequence=["#29B09D"])
         fig_tenure.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig_tenure, use_container_width=True)
+        st.plotly_chart(fig_tenure, width="stretch")
 
     with col3:
         st.markdown("### 📊 Стаж (группы)")
         tenure_df = filtered_df["tenure_group"].value_counts().reset_index()
         tenure_df.columns = ["tenure_group", "count"]
         fig_t = px.bar(tenure_df, x="tenure_group", y="count", text="count", title="Распределение стажа")
-        st.plotly_chart(fig_t, use_container_width=True)
+        st.plotly_chart(fig_t, width="stretch")

@@ -1,62 +1,205 @@
+import os
+import logging
+import glob
+from datetime import date, datetime
+from typing import Optional, Tuple
 
-import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import datetime, date
-from streamlit_plotly_events import plotly_events  # pip install streamlit-plotly-events
+import streamlit as st
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Логгирование
+# ──────────────────────────────────────────────────────────────────────────────
 
-# =========================
-# CONFIG
-# =========================
-st.set_page_config(layout="wide", page_title="HR Dashboard")
-st.title("📊 HR Dashboard v3.2")
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Константы
+# ──────────────────────────────────────────────────────────────────────────────
 
-# =========================
-# АВТОРИЗАЦИЯ
-# =========================
-try:
-    USERS = {
-        "hr": {"password": st.secrets["users"]["hr_password"], "role": "HR"},
-        "manager1": {"password": st.secrets["users"]["manager1_password"], "role": "Manager", "name": "Manager 1"},
-        "manager5": {"password": st.secrets["users"]["manager5_password"], "role": "Manager", "name": "Manager 5"},
-    }
-except:
-    # Fallback — ТОЛЬКО для разработки
-    USERS = {
-        "hr": {"password": "hr123", "role": "HR"},
-        "manager1": {"password": "123", "role": "Manager", "name": "Manager 1"},
-        "manager5": {"password": "123", "role": "Manager", "name": "Manager 5"},
-    }
-
-def login():
-    st.sidebar.title("🔐 Вход")
-    u = st.sidebar.text_input("Логин")
-    p = st.sidebar.text_input("Пароль", type="password")
-    if st.sidebar.button("Войти"):
-        if u in USERS and USERS[u]["password"] == p:
-            st.session_state.user = u
-            st.session_state.role = USERS[u]["role"]
-            st.session_state.manager_name = USERS[u].get("name", "")
-            st.rerun()
-        else:
-            st.sidebar.error("Неверный логин или пароль")
-
-if "user" not in st.session_state:
-    login()
-    st.stop()
-
-
-# =========================
-# КОНСТАНТЫ
-# =========================
-FX = {
-    "EUR": 1,
+FX_RATES: dict[str, float] = {
+    "EUR": 1.0,
     "USD": 0.92,
     "GBP": 1.17,
-    "RUB": 0.0137,  # ~1/73
+    "RUB": 0.0137,
 }
+FX_UPDATED = "2025-01-15"
+
+TENURE_BINS   = [0, 12, 36, 60, float("inf")]
+TENURE_LABELS = ["<1 года", "1–3 года", "3–5 лет", "5+ лет"]
+
+RENAME_MAP: dict[str, str] = {
+    "Full Name": "name",
+    "City": "city",
+    "Department": "department",
+    "Position": "position",
+    "Legal Entity": "legal_entity",
+    "Line Manager": "line_manager",
+    "Total Income": "salary",
+    "Currency (Total Income)": "currency",
+    "salary_satisfaction_by_employee": "salary_satisfaction",
+    "last_performance_appraisal_rating_%": "performance",
+    "number_of_projects": "projects",
+    "satisfaction_level_%": "satisfaction_raw",
+}
+
+_REQUIRED_MAIN  = {"ID"}
+_REQUIRED_DATES = {"ID", "Hire Date"}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Чтение данных
+# ──────────────────────────────────────────────────────────────────────────────
+
+def read_sheets(source) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Читает два листа Excel. Проверяет обязательные колонки."""
+    xls = pd.ExcelFile(source)
+    for name in ("Summary Data", "Start Date"):
+        if name not in xls.sheet_names:
+            raise ValueError(f"Лист '{name}' не найден. Доступные: {xls.sheet_names}")
+    df_main  = pd.read_excel(source, sheet_name="Summary Data",  header=0)
+    df_dates = pd.read_excel(source, sheet_name="Start Date",    header=0)
+    missing_main  = _REQUIRED_MAIN  - set(df_main.columns)
+    missing_dates = _REQUIRED_DATES - set(df_dates.columns)
+    if missing_main:
+        raise ValueError(f"Summary Data: отсутствуют колонки {missing_main}")
+    if missing_dates:
+        raise ValueError(f"Start Date: отсутствуют колонки {missing_dates}")
+    return df_main, df_dates
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Очистка данных
+# ──────────────────────────────────────────────────────────────────────────────
+
+def clean_float(series: pd.Series) -> pd.Series:
+    """Безопасный парсинг чисел из строк, включая '=0.85'."""
+    extracted = series.astype(str).str.extract(r"^=?\s*(-?\d+\.?\d*)", expand=False)
+    result = pd.to_numeric(extracted, errors="coerce")
+    n_bad = int(result.isna().sum() - series.isna().sum())
+    if n_bad > 0:
+        logger.warning("clean_float: %d значений не удалось распарсить → NaN", n_bad)
+    return result
+
+def clean_data(df_main: pd.DataFrame, df_dates: pd.DataFrame) -> pd.DataFrame:
+    """Очистка и мёрдж."""
+    for _df in (df_main, df_dates):
+        _df["ID"] = pd.to_numeric(_df["ID"], errors="coerce")
+    df_main  = df_main.dropna(subset=["ID"]).copy().astype({"ID": int})
+    df_dates = df_dates.dropna(subset=["ID"]).copy().astype({"ID": int})
+
+    df = df_main.merge(
+        df_dates[["ID", "Hire Date"]].rename(columns={"Hire Date": "hire_date"}),
+        on="ID", how="left"
+    )
+
+    if df["hire_date"].isna().all():
+        raise ValueError("Все hire_date = NaN после мёрджа. Проверьте ID.")
+    df = df.dropna(subset=["hire_date"]).copy()
+
+    df = df.rename(columns={k: v for k, v in RENAME_MAP.items() if k in df.columns})
+
+    if "satisfaction_raw" in df.columns:
+        df["satisfaction"] = clean_float(df["satisfaction_raw"])
+        df = df[df["satisfaction"].between(0, 1, inclusive="both")].copy()
+        df.drop(columns=["satisfaction_raw"], inplace=True, errors="ignore")
+    else:
+        df["satisfaction"] = 0.5
+
+    if "performance" in df.columns:
+        df["performance"] = clean_float(df["performance"])
+        df = df[df["performance"].between(0, 1, inclusive="both")].copy()
+    else:
+        df["performance"] = 0.5
+
+    return df
+
+def enrich_data(df: pd.DataFrame, today: Optional[date] = None) -> pd.DataFrame:
+    """Добавляет стаж, ЗП в EUR, дату среза."""
+    df = df.copy()
+    _today = today or date.today()
+    now = datetime.combine(_today, datetime.min.time())
+
+    df["hire_date"] = pd.to_datetime(df["hire_date"], errors="coerce")
+    df = df.dropna(subset=["hire_date"]).copy()
+    df["tenure_months"] = ((now - df["hire_date"]).dt.days // 30).astype(int)
+    df["tenure_group"] = pd.cut(df["tenure_months"], bins=TENURE_BINS, labels=TENURE_LABELS)
+
+    df["currency"] = df["currency"].str.strip().str.upper()
+    df["salary_eur"] = df["salary"] * df["currency"].map(FX_RATES).fillna(1)
+
+    df["snapshot_date"] = _today
+    return df
+
+def load_data(source) -> pd.DataFrame:
+    """Полный пайплайн загрузки данных."""
+    df_main, df_dates = read_sheets(source)
+    df = clean_data(df_main, df_dates)
+    return enrich_data(df)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# KPI
+# ──────────────────────────────────────────────────────────────────────────────
+
+def calc_kpis(df: pd.DataFrame) -> dict:
+    zero = {k: 0 for k in ("headcount", "avg_salary", "median_salary", "min_salary", "max_salary", "satisfaction", "performance")}
+    if df.empty:
+        return zero
+    sal = df["salary_eur"]
+    return {
+        "headcount": len(df),
+        "avg_salary": int(sal.mean()),
+        "median_salary": int(sal.median()),
+        "min_salary": int(sal.min()),
+        "max_salary": int(sal.max()),
+        "satisfaction": round(float(df["satisfaction"].mean()), 2),
+        "performance": round(float(df["performance"].mean()), 2),
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# История (снэпшоты)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parquet_available() -> bool:
+    try:
+        import pyarrow
+        return True
+    except ImportError:
+        try:
+            import fastparquet
+            return True
+        except ImportError:
+            return False
+
+def save_snapshot(df: pd.DataFrame, history_dir: str) -> str:
+    os.makedirs(history_dir, exist_ok=True)
+    today_str = str(date.today())
+    if _parquet_available():
+        path = os.path.join(history_dir, f"snapshot_{today_str}.parquet")
+        df.to_parquet(path, index=False)
+    else:
+        path = os.path.join(history_dir, f"snapshot_{today_str}.csv")
+        df.to_csv(path, index=False)
+    logger.info("Snapshot saved: %s (%d rows)", path, len(df))
+    return path
+
+def load_history(history_dir: str) -> Optional[pd.DataFrame]:
+    parquet = sorted(glob.glob(os.path.join(history_dir, "snapshot_*.parquet")))
+    csv = sorted(glob.glob(os.path.join(history_dir, "snapshot_*.csv")))
+    frames: list[pd.DataFrame] = []
+    for f in parquet:
+        frames.append(pd.read_parquet(f))
+    for f in csv:
+        frames.append(pd.read_csv(f))
+    return pd.concat(frames, ignore_index=True) if frames else None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Streamlit UI (v4.0)
+# ──────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(layout="wide", page_title="HR Dashboard v4.0")
+st.title("📊 HR Dashboard v4.0")
 
 DRILL_LEVELS = ["city", "department", "position", "employee"]
 COLORS = {
@@ -64,367 +207,306 @@ COLORS = {
     "department": "#83C9FF",
     "position": "#FF2B2B",
     "employee": "#29B09D",
-    "global": "#29B09D",
 }
 
-# Инициализация состояния
-for key, default in [("drill_path", []), ("filters", {})]:
-    if key not in st.session_state:
-        st.session_state[key] = default.copy() if isinstance(default, (dict, list)) else default
+HISTORY_DIR = os.getenv("HR_HISTORY_DIR", "hr_history")
+DATA_PATH = os.getenv("HR_DATA_PATH", "")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Авторизация
+# ──────────────────────────────────────────────────────────────────────────────
 
-# =========================
-# ЗАГРУЗКА ДАННЫХ С ДВУХ ЛИСТОВ
-# =========================
-@st.cache_data
-def load_data(uploaded_file):
+def _build_users() -> dict:
     try:
-        xls = pd.ExcelFile(uploaded_file)
-        if "Summary Data" not in xls.sheet_names:
-            st.error("❌ Лист 'Summary Data' не найден.")
-            st.stop()
-        if "Start Date" not in xls.sheet_names:
-            st.error("❌ Лист 'Start Date' не найден.")
-            st.stop()
-
-        # --- Summary Data ---
-        df_main = pd.read_excel(uploaded_file, sheet_name="Summary Data", header=0)
-        if "ID" not in df_main.columns:
-            st.error("❌ Колонка 'ID' не найдена в листе 'Summary Data'.")
-            st.stop()
-
-        if "satisfaction_level_%" in df_main.columns:
-            df_main.rename(columns={"satisfaction_level_%": "satisfaction_raw"}, inplace=True)
-
-        df_main["ID"] = pd.to_numeric(df_main["ID"], errors="coerce")
-        df_main = df_main.dropna(subset=["ID"])
-        df_main["ID"] = df_main["ID"].astype(int)
-
-        # --- Start Date ---
-        df_dates = pd.read_excel(uploaded_file, sheet_name="Start Date", header=0)
-        if "ID" not in df_dates.columns or "Hire Date" not in df_dates.columns:
-            st.error("❌ В листе 'Start Date' должны быть 'ID' и 'Hire Date'.")
-            st.stop()
-
-        df_dates = df_dates[["ID", "Hire Date"]].copy()
-        df_dates.rename(columns={"Hire Date": "hire_date"}, inplace=True)
-        df_dates["ID"] = pd.to_numeric(df_dates["ID"], errors="coerce")
-        df_dates = df_dates.dropna(subset=["ID"])
-        df_dates["ID"] = df_dates["ID"].astype(int)
-
-        # --- Объединение ---
-        df = df_main.merge(df_dates, on="ID", how="left")
-        if df["hire_date"].isna().all():
-            st.warning("⚠️ Все даты найма — NaN. Проверьте соответствие ID.")
-        df = df.dropna(subset=["hire_date"])
-
-        # --- Переименование ---
-        rename_cols = {
-            "Full Name": "name",
-            "City": "city",
-            "Department": "department",
-            "Position": "position",
-            "Legal Entity": "legal_entity",
-            "Line Manager": "line_manager",
-            "Total Income": "salary",
-            "Currency (Total Income)": "currency",
-            "salary_satisfaction_by_employee": "salary_satisfaction",
-            "last_performance_appraisal_rating_%": "performance",
-            "number_of_projects": "projects",
+        raw = st.secrets["users"]
+        return {
+            login: {
+                "password": attrs["password"],
+                "role": attrs["role"],
+                "name": attrs.get("name", login),
+            }
+            for login, attrs in raw.items()
         }
-        df = df.rename(columns={k: v for k, v in rename_cols.items() if k in df.columns})
-
-        # --- Очистка satisfaction ---
-        def clean_float(col):
-            return (col.astype(str)
-                     .str.replace(r'=.*', '', regex=True)
-                     .str.replace(r'[^\d.]', '', regex=True)
-                     .replace("", "0")
-                     .astype(float))
-
-        if "satisfaction_raw" in df.columns:
-            df["satisfaction"] = clean_float(df["satisfaction_raw"])
-            df = df[(df["satisfaction"] >= 0) & (df["satisfaction"] <= 1)]
-            df.drop(columns=["satisfaction_raw"], inplace=True, errors="ignore")
-        else:
-            df["satisfaction"] = 0.5
-
-        if "performance" in df.columns:
-            df["performance"] = clean_float(df["performance"])
-            df = df[(df["performance"] >= 0) & (df["performance"] <= 1)]
-        else:
-            df["performance"] = 0.5
-
-        # --- Стаж ---
-        df["hire_date"] = pd.to_datetime(df["hire_date"], errors="coerce")
-        df = df.dropna(subset=["hire_date"])
-        df["tenure_months"] = ((datetime.now() - df["hire_date"]).dt.days // 30).astype(int)
-
-        df["tenure_group"] = pd.cut(
-            df["tenure_months"],
-            bins=[0, 12, 36, 60, float('inf')],
-            labels=["<1 года", "1–3 года", "3–5 лет", "5+ лет"]
-        )
-
-        # --- ЗП в EUR ---
-        df["currency"] = df["currency"].str.strip().str.upper()
-        df["salary_eur"] = df["salary"] * df["currency"].map(FX).fillna(1)
-
-        # --- История ---
-        df["snapshot_date"] = date.today()
-
-        return df
-
     except Exception as e:
-        st.error("❌ Ошибка при загрузке данных:")
-        st.exception(e)
-        st.stop()
+        return {
+            "hr":       {"password": "hr123", "role": "HR",      "name": "HR Admin"},
+            "manager1": {"password": "123",   "role": "Manager", "name": "Manager 1"},
+            "manager5": {"password": "123",   "role": "Manager", "name": "Manager 5"},
+        }
 
+USERS = _build_users()
 
-# =========================
-# ЗАГРУЗКА ФАЙЛА
-# =========================
-uploaded_file = st.file_uploader("📁 Загрузите Excel-файл (Headcount)", type=["xlsx"])
+if "user" not in st.session_state:
+    st.sidebar.title("🔐 Вход")
+    u = st.sidebar.text_input("Логин")
+    p = st.sidebar.text_input("Пароль", type="password")
+    if st.sidebar.button("Войти"):
+        if u in USERS and USERS[u]["password"] == p:
+            st.session_state.update(
+                user=u,
+                role=USERS[u]["role"],
+                manager_name=USERS[u]["name"]
+            )
+            st.rerun()
+        else:
+            st.sidebar.error("Неверный логин или пароль")
+    st.stop()
 
-if uploaded_file is None:
-    st.info("Ожидается загрузка файла...")
+st.sidebar.caption(f"👤 {st.session_state.user} ({st.session_state.role})")
+if st.sidebar.button("Выйти", key="logout"):
+    for k in ["user", "role", "manager_name"]:
+        st.session_state.pop(k, None)
+    st.rerun()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Загрузка данных
+# ──────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner="Загрузка данных...")
+def _load_cached(key: str, source) -> pd.DataFrame:
+    return load_data(source)
+
+source = None
+source_key = ""
+
+if DATA_PATH and os.path.exists(DATA_PATH):
+    mtime = datetime.fromtimestamp(os.path.getmtime(DATA_PATH))
+    source = DATA_PATH
+    source_key = f"{DATA_PATH}_{mtime:%Y%m%d%H%M%S}"
+    st.sidebar.success(f"✅ Авто-файл: {os.path.basename(DATA_PATH)}")
+    st.sidebar.caption(f"Изменён: {mtime:%Y-%m-%d %H:%M}")
+else:
+    uploaded = st.file_uploader("📁 Загрузите Excel-файл (Headcount)", type=["xlsx"])
+    if uploaded:
+        source = uploaded
+        source_key = f"{uploaded.name}_{uploaded.size}"
+
+if source is None:
+    st.info("ℹ️ Установите HR_DATA_PATH или загрузите файл.")
     st.stop()
 
 try:
-    df = load_data(uploaded_file)
+    df = _load_cached(source_key, source)
+    save_snapshot(df, HISTORY_DIR)
+except ValueError as e:
+    st.error(f"❌ Ошибка данных: {e}")
+    st.stop()
 except Exception as e:
+    st.error("❌ Ошибка загрузки:")
+    st.exception(e)
     st.stop()
 
-if df is None or df.empty:
-    st.warning("❌ Данные не загружены или пусты.")
+st.caption(f"ℹ️ Курсы FX зафиксированы на {FX_UPDATED}. Обновляйте при необходимости.")
+
+if df.empty:
+    st.warning("❌ Данные пусты после загрузки.")
     st.stop()
 
+# ──────────────────────────────────────────────────────────────────────────────
+# RLS
+# ──────────────────────────────────────────────────────────────────────────────
 
-# =========================
-# Фильтрация по роли
-# =========================
 if st.session_state.role == "Manager":
-    manager_name = st.session_state.manager_name
-    df = df[df["line_manager"] == manager_name]
+    df = df[df["line_manager"] == st.session_state.manager_name]
     if df.empty:
-        st.warning(f"❌ Нет данных для руководителя: {manager_name}")
+        st.warning(f"❌ Нет данных для: {st.session_state.manager_name}")
         st.stop()
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Состояние
+# ──────────────────────────────────────────────────────────────────────────────
 
-# =========================
-# DRILL-DOWN
-# =========================
+for key, default in [("drill_path", []), ("filters", {})]:
+    if key not in st.session_state:
+        st.session_state[key] = default.copy()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Drill-down
+# ──────────────────────────────────────────────────────────────────────────────
+
 drill_path = st.session_state.drill_path
 filtered_df = df.copy()
-
 for i, value in enumerate(drill_path):
-    if i >= len(DRILL_LEVELS):
-        break
-    level = DRILL_LEVELS[i]
-    if level != "employee":
-        filtered_df = filtered_df[filtered_df[level] == value]
+    if i < len(DRILL_LEVELS) and value != "employee":
+        filtered_df = filtered_df[filtered_df[DRILL_LEVELS[i]] == value]
 
-if filtered_df.empty:
-    st.warning("❌ Нет данных по выбранным условиям.")
-    if st.button("🔄 Сбросить всё"):
-        st.session_state.drill_path = []
-        st.session_state.filters = {}
-        st.rerun()
-    st.stop()
+# ──────────────────────────────────────────────────────────────────────────────
+# Каскадные фильтры
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-# =========================
-# ФИЛЬТРЫ (безопасные — значения сверяются с текущими опциями)
-# =========================
+st.sidebar.title("🔍 Фильтры")
 filters = st.session_state.filters
-for key in ["satisfaction", "position", "legal_entity"]:
-    if key not in filters:
-        filters[key] = []
+for key in ["city", "department", "position", "legal_entity", "line_manager", "salary_satisfaction"]:
+    filters.setdefault(key, [])
 
-# Актуальные опции (после фильтров)
-sats_opt = ["low", "medium", "high"]
-pos_opt = filtered_df["position"].dropna().unique().tolist()
-ent_opt = filtered_df["legal_entity"].dropna().unique().tolist()
+def _opts(col: str, base: pd.DataFrame) -> list:
+    return sorted(base[col].dropna().unique().tolist())
 
-# 🔐 Очистка фильтров от устаревших значений
-filters["satisfaction"] = [s for s in filters["satisfaction"] if s in sats_opt]
-filters["position"] = [p for p in filters["position"] if p in pos_opt]
-filters["legal_entity"] = [e for e in filters["legal_entity"] if e in ent_opt]
+def _clean(key: str, opts: list) -> list:
+    return [v for v in filters[key] if v in opts]
 
-# Применение
-sats = st.multiselect("Удовл. ЗП", options=sats_opt, default=filters["satisfaction"])
-positions = st.multiselect("Позиция", options=pos_opt, default=filters["position"])
-entities = st.multiselect("Юр.лицо", options=ent_opt, default=filters["legal_entity"])
+_city_opts = _opts("city", filtered_df)
+filters["city"] = _clean("city", _city_opts)
+sel_city = st.sidebar.multiselect("Город", _city_opts, default=filters["city"])
+filters["city"] = sel_city
+_city_df = filtered_df[filtered_df["city"].isin(sel_city)] if sel_city else filtered_df
 
-# Сохранение
-filters.update({
-    "satisfaction": sats,
-    "position": positions,
-    "legal_entity": entities
-})
+_dept_opts = _opts("department", _city_df)
+filters["department"] = _clean("department", _dept_opts)
+sel_dept = st.sidebar.multiselect("Департамент", _dept_opts, default=filters["department"])
+filters["department"] = sel_dept
+_dept_df = _city_df[_city_df["department"].isin(sel_dept)] if sel_dept else _city_df
 
-# Применение фильтрации
-mask = pd.Series([True] * len(filtered_df), index=filtered_df.index)
-if sats: mask &= filtered_df["salary_satisfaction"].isin(sats)
-if positions: mask &= filtered_df["position"].isin(positions)
-if entities: mask &= filtered_df["legal_entity"].isin(entities)
-filtered_df = filtered_df[mask]
+_pos_opts = _opts("position", _dept_df)
+filters["position"] = _clean("position", _pos_opts)
+sel_pos = st.sidebar.multiselect("Позиция", _pos_opts, default=filters["position"])
+filters["position"] = sel_pos
+_pos_df = _dept_df[_dept_df["position"].isin(sel_pos)] if sel_pos else _dept_df
 
+_ent_opts = _opts("legal_entity", _pos_df)
+filters["legal_entity"] = _clean("legal_entity", _ent_opts)
+sel_ent = st.sidebar.multiselect("Юр. лицо", _ent_opts, default=filters["legal_entity"])
+filters["legal_entity"] = sel_ent
+_ent_df = _pos_df[_pos_df["legal_entity"].isin(sel_ent)] if sel_ent else _pos_df
 
-# =========================
-# BREADCRUMBS
-# =========================
-st.markdown("### 🛤 Навигация")
-cols = st.columns(len(drill_path) + 2)
+_mgr_opts = _opts("line_manager", _ent_df)
+filters["line_manager"] = _clean("line_manager", _mgr_opts)
+sel_mgr = st.sidebar.multiselect("Line Manager", _mgr_opts, default=filters["line_manager"])
+filters["line_manager"] = sel_mgr
+_mgr_df = _ent_df[_ent_df["line_manager"].isin(sel_mgr)] if sel_mgr else _ent_df
 
-if cols[0].button(" 🌍 Все ", key="root"):
+_sat_opts = ["low", "medium", "high"]
+filters["salary_satisfaction"] = _clean("salary_satisfaction", _sat_opts)
+sel_sat = st.sidebar.multiselect("Удовл. ЗП", _sat_opts, default=filters["salary_satisfaction"])
+filters["salary_satisfaction"] = sel_sat
+filtered_df = _mgr_df[_mgr_df["salary_satisfaction"].isin(sel_sat)] if sel_sat else _mgr_df
+
+if st.sidebar.button("⏪ Сбросить фильтры и drill-down"):
     st.session_state.drill_path = []
     st.session_state.filters = {}
     st.rerun()
 
+if filtered_df.empty:
+    st.warning("❌ Нет данных по условиям.")
+    st.stop()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Breadcrumbs
+# ──────────────────────────────────────────────────────────────────────────────
+
+st.markdown("### 🛤 Навигация (drill-down)")
+cols = st.columns(max(len(drill_path) + 1, 2))
+if cols[0].button("🌍 Все", key="root"):
+    st.session_state.drill_path = []
+    st.rerun()
 for i, crumb in enumerate(drill_path):
-    if cols[i+1].button(f" {crumb} ", key=f"crumb_{i}"):
+    if cols[i+1].button(f"▶ {crumb}", key=f"crumb_{i}"):
         st.session_state.drill_path = drill_path[:i]
         st.rerun()
 
-if cols[-1].button("⏪ Сброс"):
-    st.session_state.drill_path = []
-    st.session_state.filters = {}
-    st.rerun()
-
-
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
 # KPI
-# =========================
-@st.cache_data
-def calc_kpis(_df):
-    return {
-        "headcount": len(_df),
-        "avg_salary": int(_df["salary_eur"].mean()) if not _df.empty else 0,
-        "median_salary": int(_df["salary_eur"].median()) if not _df.empty else 0,
-        "satisfaction": round(_df["satisfaction"].mean(), 2) if not _df.empty else 0.0,
-        "performance": round(_df["performance"].mean(), 2) if not _df.empty else 0.0,
-    }
+# ──────────────────────────────────────────────────────────────────────────────
 
-kpi_data = calc_kpis(filtered_df)
-
+kpi = calc_kpis(filtered_df)
 st.markdown("---")
 st.subheader("🎯 Ключевые метрики")
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Численность", kpi_data["headcount"])
-k2.metric("Ср. ЗП €", f"{kpi_data['avg_salary']:,}")
-k3.metric("Медиана €", f"{kpi_data['median_salary']:,}")
-k4.metric("Удовл.", kpi_data["satisfaction"])
-k5.metric("Перф.", kpi_data["performance"])
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+c1.metric("Численность", kpi["headcount"])
+c2.metric("Ср. ЗП €", f"{kpi['avg_salary']:,}")
+c3.metric("Медиана €", f"{kpi['median_salary']:,}", help="Устойчива к выбросам")
+c4.metric("Min ЗП €", f"{kpi['min_salary']:,}")
+c5.metric("Max ЗП €", f"{kpi['max_salary']:,}")
+c6.metric("Удовл.", kpi["satisfaction"])
+c7.metric("Перф.", kpi["performance"])
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Доли (%)
+# ──────────────────────────────────────────────────────────────────────────────
 
-# =========================
-# ПРОЦЕНТЫ 📊
-# =========================
 st.markdown("---")
-st.subheader("📊 Доли (проценты)")
-
+st.subheader("📊 Доли")
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("### % по городам")
     city_pct = filtered_df["city"].value_counts(normalize=True).reset_index()
     city_pct.columns = ["city", "percent"]
     city_pct["percent"] = (city_pct["percent"] * 100).round(1)
-    fig_city = px.bar(city_pct, x="city", y="percent", text=city_pct["percent"].astype(str) + "%",
-                      title="Доля сотрудников по городам", color_discrete_sequence=["#0068C9"])
-    fig_city.update_layout(xaxis_categoryorder="total descending")
-    st.plotly_chart(fig_city, width="stretch")
+    fig_city_pct = px.bar(city_pct, x="city", y="percent", text=city_pct["percent"].astype(str) + "%",
+                          title="Доля по городам (%)", color_discrete_sequence=[COLORS["city"]])
+    fig_city_pct.update_layout(xaxis_categoryorder="total descending")
+    st.plotly_chart(fig_city_pct, use_container_width=True)
 
 with col2:
-    st.markdown("### % Удовлетворённости ЗП")
     sat_pct = filtered_df["salary_satisfaction"].value_counts(normalize=True).reset_index()
     sat_pct.columns = ["salary_satisfaction", "percent"]
     sat_pct["percent"] = (sat_pct["percent"] * 100).round(1)
-    fig_sat = px.pie(sat_pct, names="salary_satisfaction", values="percent", title="Удовлетворённость ЗП (%)")
-    st.plotly_chart(fig_sat, width="stretch")
+    fig_sat_pct = px.bar(sat_pct, x="salary_satisfaction", y="percent", text=sat_pct["percent"].astype(str) + "%",
+                         title="Удовлетворённость ЗП (%)", color="salary_satisfaction",
+                         color_discrete_map={"low": "#FF2B2B", "medium": "#FFA500", "high": "#29B09D"},
+                         category_orders={"salary_satisfaction": ["low", "medium", "high"]})
+    st.plotly_chart(fig_sat_pct, use_container_width=True)
 
-
-# =========================
-# DRILL-DOWN CHARTS
-# =========================
-@st.cache_data
-def get_agg(_df, col):
-    return _df.groupby(col).size().reset_index(name="count").sort_values("count", ascending=False)
+# ──────────────────────────────────────────────────────────────────────────────
+# Drill-down charts (на основе on_select)
+# ──────────────────────────────────────────────────────────────────────────────
 
 next_level = DRILL_LEVELS[len(drill_path)] if len(drill_path) < len(DRILL_LEVELS) else None
 
+def _render_drill_bar(base_df: pd.DataFrame, col: str, level: str, key: str) -> None:
+    data = base_df.groupby(col).size().reset_index(name="count").sort_values("count", ascending=False)
+    fig = px.bar(data, x=col, y="count", text="count", color_discrete_sequence=[COLORS[level]])
+    fig.update_layout(xaxis_categoryorder="total descending", clickmode="event+select")
+    event = st.plotly_chart(fig, on_select="rerun", key=key, use_container_width=True)
+    points = getattr(getattr(event, "selection", None), "points", [])
+    if points and "x" in points[0]:
+        val = str(points[0]["x"])
+        if val in base_df[col].values:
+            st.session_state.drill_path.append(val)
+            st.rerun()
+
+st.markdown("---")
+
 if next_level == "city":
     st.subheader("📍 Выберите город")
-    data = get_agg(filtered_df, "city")
-    fig = px.bar(data, x="city", y="count", text="count", title="Города", color_discrete_sequence=[COLORS["city"]])
-    fig.update_layout(xaxis_categoryorder="total descending")
-    selected = plotly_events(fig, click_event=True, override_height=400)
-    if selected:
-        val = str(selected[0]["x"])
-        if val in filtered_df["city"].values:
-            st.session_state.drill_path.append(val)
-            st.rerun()
-
+    _render_drill_bar(filtered_df, "city", "city", "drill_city")
 elif next_level == "department":
     st.subheader("🏢 Выберите департамент")
-    data = get_agg(filtered_df, "department")
-    fig = px.bar(data, x="department", y="count", text="count", title="Департаменты", color_discrete_sequence=[COLORS["department"]])
-    fig.update_layout(xaxis_categoryorder="total descending")
-    selected = plotly_events(fig, click_event=True, override_height=400)
-    if selected:
-        val = str(selected[0]["x"])
-        if val in filtered_df["department"].values:
-            st.session_state.drill_path.append(val)
-            st.rerun()
-
+    _render_drill_bar(filtered_df, "department", "department", "drill_dept")
 elif next_level == "position":
     st.subheader("👷 Выберите позицию")
-    data = get_agg(filtered_df, "position")
-    fig = px.bar(data, x="position", y="count", text="count", title="Позиции", color_discrete_sequence=[COLORS["position"]])
-    fig.update_layout(xaxis_categoryorder="total descending")
-    selected = plotly_events(fig, click_event=True, override_height=400)
-    if selected:
-        val = str(selected[0]["x"])
-        if val in filtered_df["position"].values:
-            st.session_state.drill_path.append(val)
-            st.rerun()
-
+    _render_drill_bar(filtered_df, "position", "position", "drill_pos")
 elif next_level == "employee" or len(drill_path) >= len(DRILL_LEVELS):
     st.subheader("📋 Сотрудники")
-    emp_df = filtered_df[[
-        "name", "city", "department", "position", "legal_entity", "salary",
-        "salary_satisfaction", "satisfaction", "performance", "tenure_months"
-    ]].sort_values("salary", ascending=False)
-    st.dataframe(emp_df, use_container_width=True, hide_index=True)
+    emp_cols = [c for c in ["name", "city", "department", "position", "legal_entity", "salary", "currency",
+                            "salary_satisfaction", "satisfaction", "performance", "tenure_months"]
+                if c in filtered_df.columns]
+    st.dataframe(filtered_df[emp_cols].sort_values("salary", ascending=False), use_container_width=True, hide_index=True)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Дополнительные графики
+# ──────────────────────────────────────────────────────────────────────────────
 
-# =========================
-# BOX PLOT СТАЖА
-# =========================
 if len(drill_path) < 3:
     st.markdown("---")
     st.subheader("📈 Дополнительные графики")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.markdown("### 📦 Зарплаты (€)")
-        fig_box = px.box(filtered_df, x="department", y="salary_eur", points="outliers",
-                         color="position", title="Распределение ЗП")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("#### 📦 Зарплаты (€)")
+        fig_box = px.box(filtered_df, x="department", y="salary_eur", points="outliers", color="position",
+                         title="Распределение ЗП")
         fig_box.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig_box, width="stretch")
-
-    with col2:
-        st.markdown("### ⏱ Стаж по департаментам")
+        st.plotly_chart(fig_box, use_container_width=True)
+    with c2:
+        st.markdown("#### ⏱ Стаж (месяцы)")
         fig_tenure = px.box(filtered_df, x="department", y="tenure_months", points="outliers",
-                            title="Стаж (месяцы)", color_discrete_sequence=["#29B09D"])
+                            title="Стаж по департаментам", color_discrete_sequence=["#29B09D"])
         fig_tenure.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig_tenure, width="stretch")
-
-    with col3:
-        st.markdown("### 📊 Стаж (группы)")
-        tenure_df = filtered_df["tenure_group"].value_counts().reset_index()
-        tenure_df.columns = ["tenure_group", "count"]
-        fig_t = px.bar(tenure_df, x="tenure_group", y="count", text="count", title="Распределение стажа")
-        st.plotly_chart(fig_t, width="stretch")
+        st.plotly_chart(fig_tenure, use_container_width=True)
+    with c3:
+        st.markdown("#### 📊 Стаж (группы)")
+        tenure_counts = filtered_df["tenure_group"].value_counts().reindex(TENURE_LABELS).fillna(0).reset_index()
+        tenure_counts.columns = ["tenure_group", "count"]
+        fig_t = px.bar(tenure_counts, x="tenure_group", y="count", text="count", title="Распределение стажа",
+                       color_discrete_sequence=[COLORS["city"]])
+        st.plotly_chart(fig_t, use_container_width=True)
